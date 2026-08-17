@@ -149,6 +149,14 @@ async def get_teams_from_channel():
             if message.author.bot:
                 continue
 
+            print("TEAMS DEBUG: Raw message content:", repr(message.content))
+
+            # First handle Discord role mentions
+            for role in message.role_mentions:
+                print("TEAMS DEBUG: Found role mention:", role.name)
+                teams.append(role.name)
+
+            # Then handle plain text lines
             lines = message.content.splitlines()
 
             for line in lines:
@@ -157,33 +165,26 @@ async def get_teams_from_channel():
                 if not team:
                     continue
 
+                # Remove bullets
                 while team.startswith("-") or team.startswith("•") or team.startswith("*"):
                     team = team[1:].strip()
 
-                # Convert Discord role mentions like <@&123456789> into role names
+                # Skip raw Discord role mentions because we already handled them above
                 if team.startswith("<@&") and team.endswith(">"):
-                    role_id_text = team.replace("<@&", "").replace(">", "")
-
-                    try:
-                        role_id = int(role_id_text)
-                        role = message.guild.get_role(role_id)
-
-                        if role:
-                            team = role.name
-                        else:
-                            print(f"TEAMS WARNING: Could not find role for ID {role_id}")
-                            continue
-
-                    except ValueError:
-                        continue
-
-                # Convert user mentions like <@123456789> or <@!123456789>
-                elif team.startswith("<@") and team.endswith(">"):
-                    print(f"TEAMS WARNING: Skipping user mention: {team}")
                     continue
 
-                if team:
-                    teams.append(team)
+                # Skip user/channel mentions
+                if team.startswith("<@") and team.endswith(">"):
+                    continue
+
+                if team.startswith("<#") and team.endswith(">"):
+                    continue
+
+                # Skip lines that are only mentions mixed together
+                if "<@&" in team:
+                    continue
+
+                teams.append(team)
 
     except discord.Forbidden:
         print("TEAMS ERROR: Bot does not have permission to read the teams channel.")
@@ -197,6 +198,11 @@ async def get_teams_from_channel():
     seen = set()
 
     for team in teams:
+        team = team.strip()
+
+        if not team:
+            continue
+
         key = team.lower()
 
         if key not in seen:
