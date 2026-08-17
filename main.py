@@ -23,16 +23,36 @@ load_dotenv()
 
 app = Flask(__name__)
 
-app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-key")
+# Use FLASK_SECRET_KEY if you have it, otherwise fall back to SECRET_KEY
+app.secret_key = (
+    os.getenv("FLASK_SECRET_KEY")
+    or os.getenv("SECRET_KEY")
+    or "change-this-secret-key"
+)
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://ucgtreffingwebsite.netlify.app"
+).rstrip("/")
+
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://ucgt-website-helper-production.up.railway.app"
+).rstrip("/")
+
+# Important for cross-site cookies between Netlify frontend and Railway backend
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+)
 
 CORS(
     app,
     supports_credentials=True,
     origins=[
         FRONTEND_URL,
+        "https://ucgtreffingwebsite.netlify.app",
         "http://localhost:8888",
         "http://localhost:3000",
         "http://127.0.0.1:8888",
@@ -49,7 +69,11 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
-REDIRECT_URI = f"{BACKEND_URL}/auth/callback"
+# Prefer Railway env var if set, otherwise use the fixed API callback route
+REDIRECT_URI = os.getenv(
+    "DISCORD_REDIRECT_URI",
+    f"{BACKEND_URL}/api/auth/callback"
+)
 
 DISCORD_API_BASE = "https://discord.com/api"
 DISCORD_AUTH_URL = "https://discord.com/oauth2/authorize"
@@ -64,7 +88,9 @@ GUILD_ID = os.getenv("GUILD_ID", "")
 TEAMS_CHANNEL_ID = os.getenv("TEAMS_CHANNEL_ID", "")
 SCORE_CHANNEL_ID = os.getenv("SCORE_CHANNEL_ID", "")
 
-REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "Referee")
+# Your previous summaries said the role is League Referee.
+# Railway can override this with REFEREE_ROLE_NAME.
+REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "League Referee")
 
 
 # =========================
@@ -255,6 +281,7 @@ def get_discord_user(access_token):
     )
 
     if response.status_code != 200:
+        print(f"Failed to get Discord user: {response.text}", flush=True)
         return None
 
     return response.json()
@@ -262,6 +289,7 @@ def get_discord_user(access_token):
 
 def get_user_guild_member(user_id):
     if not DISCORD_BOT_TOKEN or not GUILD_ID:
+        print("DISCORD_BOT_TOKEN or GUILD_ID missing for member lookup.", flush=True)
         return None
 
     response = requests.get(
@@ -273,6 +301,7 @@ def get_user_guild_member(user_id):
     )
 
     if response.status_code != 200:
+        print(f"Failed to get guild member: {response.status_code} {response.text}", flush=True)
         return None
 
     return response.json()
@@ -285,12 +314,17 @@ def user_has_referee_role(member_data):
     guild = get_guild()
 
     if not guild:
+        print("Could not find guild while checking referee role.", flush=True)
         return False
 
     role_ids = member_data.get("roles", [])
 
     for role_id in role_ids:
-        role = guild.get_role(int(role_id))
+        try:
+            role = guild.get_role(int(role_id))
+        except Exception:
+            role = None
+
         if role and role.name.lower() == REFEREE_ROLE_NAME.lower():
             return True
 
@@ -324,24 +358,42 @@ def health():
 # Discord OAuth routes
 # =========================
 
+@app.route("/auth/login")
+@app.route("/api/auth/login")
 @app.route("/auth/discord")
+@app.route("/api/auth/discord")
 def auth_discord():
+    if not DISCORD_CLIENT_ID:
+        return jsonify({
+            "error": "DISCORD_CLIENT_ID is missing from Railway variables."
+        }), 500
+
+    if not REDIRECT_URI:
+        return jsonify({
+            "error": "DISCORD_REDIRECT_URI or BACKEND_URL is missing."
+        }), 500
+
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
-        "prompt": "none",
     }
 
     return redirect(f"{DISCORD_AUTH_URL}?{urlencode(params)}")
 
 
 @app.route("/auth/callback")
+@app.route("/api/auth/callback")
 def auth_callback():
     code = request.args.get("code")
 
     if not code:
+        print("No Discord code provided.", flush=True)
+        return redirect(f"{FRONTEND_URL}/denied.html")
+
+    if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+        print("Discord client ID or secret missing.", flush=True)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
     token_data = {
@@ -364,12 +416,14 @@ def auth_callback():
     )
 
     if token_response.status_code != 200:
-        print(f"Token exchange failed: {token_response.text}", flush=True)
+        print(f"Token exchange failed: {token_response.status_code} {token_response.text}", flush=True)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
-    access_token = token_response.json().get("access_token")
+    token_json = token_response.json()
+    access_token = token_json.get("access_token")
 
     if not access_token:
+        print(f"No access token in Discord response: {token_json}", flush=True)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
     user = get_discord_user(access_token)
@@ -381,6 +435,10 @@ def auth_callback():
     has_role = user_has_referee_role(member_data)
 
     if not has_role:
+        print(
+            f"User {user.get('username')} does not have role {REFEREE_ROLE_NAME}.",
+            flush=True,
+        )
         session.clear()
         return redirect(f"{FRONTEND_URL}/denied.html")
 
@@ -396,9 +454,16 @@ def auth_callback():
 
 
 @app.route("/auth/logout")
+@app.route("/api/auth/logout")
 def auth_logout():
     session.clear()
-    return redirect(f"{FRONTEND_URL}/login.html")
+
+    # If called by fetch(), return JSON.
+    # If opened directly in browser, this is still okay.
+    return jsonify({
+        "success": True,
+        "message": "Logged out"
+    })
 
 
 # =========================
@@ -411,11 +476,16 @@ def api_me():
 
     if not user or not session.get("is_referee"):
         return jsonify({
-            "authenticated": False
+            "authenticated": False,
+            "logged_in": False,
+            "is_referee": False,
+            "user": None
         }), 401
 
     return jsonify({
         "authenticated": True,
+        "logged_in": True,
+        "is_referee": True,
         "user": user
     })
 
@@ -536,6 +606,20 @@ def api_debug_discord():
         return jsonify({
             "error": str(e)
         }), 500
+
+
+@app.route("/api/routes")
+def api_routes():
+    routes = []
+
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            "endpoint": rule.endpoint,
+            "methods": sorted(list(rule.methods)),
+            "rule": str(rule)
+        })
+
+    return jsonify(routes)
 
 
 # =========================
