@@ -1,66 +1,69 @@
 import os
 import asyncio
 import threading
-
-import discord
 import requests
 
-from flask import Flask, jsonify, redirect, request, session
+from flask import Flask, jsonify, request, session, redirect
 from flask_cors import CORS
 
+import discord
+from discord.ext import commands
+
+
 # =========================
-# CONFIG
+# Railway Variables
 # =========================
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "PUT_TOKEN_HERE")
-CLIENT_ID = os.getenv("CLIENT_ID", "PUT_CLIENT_ID_HERE")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "PUT_CLIENT_SECRET_HERE")
-
-GUILD_ID = int(os.getenv("GUILD_ID", "123456789012345678"))
-SCORES_CHANNEL_ID = int(os.getenv("SCORES_CHANNEL_ID", "123456789012345678"))
-
-TEAM_ROLE_PREFIX = os.getenv("TEAM_ROLE_PREFIX", "Team")
-REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "League Referee")
-
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+SCORES_CHANNEL_ID = int(os.getenv("SCORES_CHANNEL_ID", "0"))
 SESSION_SECRET = os.getenv("SESSION_SECRET", "change-this-secret")
 
-BACKEND_URL = os.getenv("BACKEND_URL", "https://your-railway-app.up.railway.app")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://your-netlify-site.netlify.app")
+# Your Netlify frontend URL
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://your-site.netlify.app")
 
-PORT = int(os.getenv("PORT", 5000))
+# Your Railway backend URL
+BACKEND_URL = os.getenv("BACKEND_URL", "https://your-backend.up.railway.app")
+
+# Discord role allowed to use the ref website
+REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "League Referee")
+
+# Channel where teams are listed
+TEAMS_CHANNEL_NAME = os.getenv("TEAMS_CHANNEL_NAME", "teams")
+
 
 # =========================
-# FLASK SETUP
+# Flask App
 # =========================
 
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 
-# Needed because Netlify and Railway are different domains.
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True
+)
+
 CORS(
     app,
     supports_credentials=True,
-    origins=[
-        FRONTEND_URL
-    ]
+    origins=[FRONTEND_URL]
 )
 
-# Cookie settings for Netlify <-> Railway session
-app.config.update(
-    SESSION_COOKIE_SAMESITE="None",
-    SESSION_COOKIE_SECURE=True
-)
 
 # =========================
-# DISCORD BOT SETUP
+# Discord Bot
 # =========================
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
+intents.message_content = True
 
-bot = discord.Client(intents=intents)
-bot_loop = None
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 @bot.event
@@ -68,136 +71,158 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-def run_bot():
-    global bot_loop
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
-    bot_loop.run_until_complete(bot.start(DISCORD_TOKEN))
+# =========================
+# Helpers
+# =========================
+
+def is_logged_in():
+    return "discord_user_id" in session
 
 
-def run_coroutine(coro):
-    future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
-    return future.result(timeout=20)
+def login_required(func):
+    def wrapper(*args, **kwargs):
+        if not is_logged_in():
+            return jsonify({"error": "Not logged in"}), 401
+
+        if not session.get("is_referee"):
+            return jsonify({"error": "Access denied"}), 403
+
+        return func(*args, **kwargs)
+
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
-async def get_member(user_id):
+async def get_member_from_guild(discord_user_id):
     guild = bot.get_guild(GUILD_ID)
 
-    if guild is None:
+    if not guild:
         return None
 
     try:
-        member = guild.get_member(int(user_id))
+        member = guild.get_member(int(discord_user_id))
 
         if member is None:
-            member = await guild.fetch_member(int(user_id))
+            member = await guild.fetch_member(int(discord_user_id))
 
         return member
+
     except Exception as e:
-        print("get_member error:", e)
+        print("Failed to get member:", e)
         return None
 
 
-async def get_team_roles():
+def user_has_referee_role(member):
+    if member is None:
+        return False
+
+    return any(role.name == REFEREE_ROLE_NAME for role in member.roles)
+
+
+async def get_teams_from_discord_channel():
     guild = bot.get_guild(GUILD_ID)
 
-    if guild is None:
+    if not guild:
+        return []
+
+    teams_channel = discord.utils.get(
+        guild.text_channels,
+        name=TEAMS_CHANNEL_NAME
+    )
+
+    if not teams_channel:
+        print(f"No Discord channel named #{TEAMS_CHANNEL_NAME} found.")
         return []
 
     teams = []
 
-    for role in guild.roles:
-        if role.name.startswith(TEAM_ROLE_PREFIX):
-            teams.append({
-                "id": str(role.id),
-                "name": role.name
-            })
+    try:
+        async for message in teams_channel.history(limit=100):
+            if message.author.bot:
+                continue
 
-    teams.sort(key=lambda x: x["name"].lower())
-    return teams
+            lines = message.content.splitlines()
+
+            for line in lines:
+                team_name = line.strip()
+
+                if not team_name:
+                    continue
+
+                # Optional cleanup if people use bullets
+                team_name = team_name.removeprefix("-").strip()
+                team_name = team_name.removeprefix("•").strip()
+
+                if team_name and team_name not in teams:
+                    teams.append(team_name)
+
+    except Exception as e:
+        print("Failed to read teams channel:", e)
+
+    return sorted(teams)
 
 
-async def discord_send_score(message):
-    channel = bot.get_channel(SCORES_CHANNEL_ID)
-
-    if channel is None:
-        channel = await bot.fetch_channel(SCORES_CHANNEL_ID)
-
-    await channel.send(message)
-
-
-def require_referee():
-    return session.get("user") and session.get("is_referee")
+def run_async(coro, timeout=10):
+    future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+    return future.result(timeout=timeout)
 
 
 # =========================
-# BASIC ROUTES
+# Auth Routes
 # =========================
 
 @app.route("/")
-def health():
-    return jsonify({
-        "status": "online",
-        "name": "UCGT Reffing System Backend"
-    })
+def home():
+    return jsonify({"status": "UCGT Reffing System backend online"})
 
-
-@app.route("/api/status")
-def api_status():
-    return jsonify({
-        "online": True,
-        "bot": str(bot.user) if bot.user else None
-    })
-
-
-# =========================
-# DISCORD LOGIN
-# =========================
 
 @app.route("/auth/discord")
 def auth_discord():
-    redirect_uri = f"{BACKEND_URL}/auth/discord/callback"
+    redirect_uri = f"{BACKEND_URL}/auth/callback"
 
     discord_auth_url = (
         "https://discord.com/oauth2/authorize"
         f"?client_id={CLIENT_ID}"
-        f"&redirect_uri={requests.utils.quote(redirect_uri)}"
+        f"&redirect_uri={redirect_uri}"
         "&response_type=code"
-        f"&scope={requests.utils.quote('identify')}"
+        "&scope=identify"
     )
 
     return redirect(discord_auth_url)
 
 
-@app.route("/auth/discord/callback")
-def auth_discord_callback():
+@app.route("/auth/callback")
+def auth_callback():
     code = request.args.get("code")
 
     if not code:
-        return redirect(f"{FRONTEND_URL}/login.html")
+        return redirect(f"{FRONTEND_URL}/denied.html")
 
-    redirect_uri = f"{BACKEND_URL}/auth/discord/callback"
+    redirect_uri = f"{BACKEND_URL}/auth/callback"
+
+    token_data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri
+    }
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
     token_response = requests.post(
         "https://discord.com/api/oauth2/token",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
-        data={
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri
-        }
+        data=token_data,
+        headers=headers
     )
 
-    token_data = token_response.json()
-    access_token = token_data.get("access_token")
+    if token_response.status_code != 200:
+        print("OAuth token error:", token_response.text)
+        return redirect(f"{FRONTEND_URL}/denied.html")
 
-    if not access_token:
-        print("OAuth token error:", token_data)
-        return redirect(f"{FRONTEND_URL}/login.html")
+    access_token = token_response.json().get("access_token")
 
     user_response = requests.get(
         "https://discord.com/api/users/@me",
@@ -206,101 +231,122 @@ def auth_discord_callback():
         }
     )
 
-    discord_user = user_response.json()
-    user_id = discord_user.get("id")
-
-    if not user_id:
-        return redirect(f"{FRONTEND_URL}/login.html")
-
-    member = run_coroutine(get_member(user_id))
-
-    if member is None:
+    if user_response.status_code != 200:
+        print("Discord user fetch error:", user_response.text)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
-    has_referee_role = any(role.name == REFEREE_ROLE_NAME for role in member.roles)
+    user = user_response.json()
+    discord_user_id = user["id"]
 
-    if not has_referee_role:
+    member = run_async(get_member_from_guild(discord_user_id))
+
+    if not user_has_referee_role(member):
+        session.clear()
         return redirect(f"{FRONTEND_URL}/denied.html")
 
-    session["user"] = {
-        "id": discord_user.get("id"),
-        "username": discord_user.get("username"),
-        "avatar": discord_user.get("avatar")
-    }
-
+    session["discord_user_id"] = discord_user_id
+    session["username"] = user.get("username")
+    session["avatar"] = user.get("avatar")
     session["is_referee"] = True
 
     return redirect(f"{FRONTEND_URL}/index.html")
 
 
-@app.route("/auth/logout")
+@app.route("/logout")
 def logout():
     session.clear()
     return redirect(f"{FRONTEND_URL}/login.html")
 
 
 # =========================
-# API ROUTES
+# API Routes
 # =========================
 
 @app.route("/api/me")
+@login_required
 def api_me():
-    if not require_referee():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    return jsonify(session.get("user"))
+    return jsonify({
+        "loggedIn": True,
+        "id": session.get("discord_user_id"),
+        "username": session.get("username"),
+        "isReferee": session.get("is_referee", False)
+    })
 
 
 @app.route("/api/teams")
+@login_required
 def api_teams():
-    if not require_referee():
-        return jsonify({"error": "Unauthorized"}), 401
+    teams = run_async(get_teams_from_discord_channel())
 
-    try:
-        teams = run_coroutine(get_team_roles())
-        return jsonify(teams)
-    except Exception as e:
-        print("teams error:", e)
-        return jsonify({"error": "Failed to fetch teams"}), 500
+    return jsonify({
+        "teams": teams
+    })
 
 
 @app.route("/api/send-score", methods=["POST"])
+@login_required
 def api_send_score():
-    if not require_referee():
-        return jsonify({"error": "Unauthorized"}), 401
-
     data = request.get_json() or {}
 
-    team1 = data.get("team1", "Team 1")
-    team2 = data.get("team2", "Team 2")
-    winner = data.get("winner", "")
-    loser = data.get("loser", "")
-    score = data.get("score", "")
+    team1 = data.get("team1")
+    team2 = data.get("team2")
+    winner = data.get("winner")
+    loser = data.get("loser")
+    score = data.get("score")
     auto_forfeit = data.get("autoForfeit", False)
+    forfeited_team = data.get("forfeitedTeam")
 
-    message = f"""{team1} vs {team2}
-> Winner: {winner}
-> Score: {score}
-> Loser: {loser}"""
+    if not team1 or not team2 or not winner or not loser or not score:
+        return jsonify({"error": "Missing score data"}), 400
 
-    if auto_forfeit:
-        message += """
-> Team get 5 warnings and then got auto forfeited"""
+    async def send_score_message():
+        channel = bot.get_channel(SCORES_CHANNEL_ID)
 
-    try:
-        run_coroutine(discord_send_score(message))
-        return jsonify({"success": True})
-    except Exception as e:
-        print("send score error:", e)
-        return jsonify({"error": "Failed to send score"}), 500
+        if channel is None:
+            return False
+
+        message = (
+            f"{team1} vs {team2}\n"
+            f"> Winner: {winner}\n"
+            f"> Score: {score}\n"
+            f"> Loser: {loser}"
+        )
+
+        if auto_forfeit:
+            message += (
+                f"\n> {forfeited_team} got 5 warnings and then got auto forfeited"
+            )
+
+        await channel.send(message)
+        return True
+
+    sent = run_async(send_score_message())
+
+    if not sent:
+        return jsonify({"error": "Scores channel not found"}), 404
+
+    return jsonify({
+        "success": True,
+        "message": "Score posted"
+    })
 
 
 # =========================
-# START APP
+# Start Bot and Flask
 # =========================
+
+def run_bot():
+    bot.run(DISCORD_TOKEN)
+
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
     bot_thread.start()
 
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.getenv("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
