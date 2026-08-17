@@ -4,42 +4,46 @@ import threading
 import requests
 import discord
 
-from discord.ext import commands
-from flask import Flask, request, redirect, jsonify, session
+from flask import Flask, redirect, request, jsonify, session
 from flask_cors import CORS
+from discord.ext import commands
 from dotenv import load_dotenv
-
 
 load_dotenv()
 
-app = Flask(__name__)
+# -----------------------------
+# Flask App Setup
+# -----------------------------
 
+app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret-key")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ucgtreffingwebsite.netlify.app").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://ucgt-website-helper-production.up.railway.app").rstrip("/")
 
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
-
-REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "League Referee")
-TEAMS_CHANNEL_ID = int(os.getenv("TEAMS_CHANNEL_ID", "0"))
-
-SCORE_CHANNEL_ID = int(os.getenv("SCORE_CHANNEL_ID", "0"))
-
-REDIRECT_URI = f"{BACKEND_URL}/auth/callback"
-
-
 CORS(
     app,
     supports_credentials=True,
-    origins=[
-        FRONTEND_URL,
-        "https://ucgtreffingwebsite.netlify.app",
-    ],
+    origins=[FRONTEND_URL]
 )
+
+# -----------------------------
+# Environment Variables
+# -----------------------------
+
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+GUILD_ID = os.getenv("GUILD_ID")
+REFEREE_ROLE_NAME = os.getenv("REFEREE_ROLE_NAME", "League Referee")
+
+TEAMS_CHANNEL_ID = os.getenv("TEAMS_CHANNEL_ID")
+SCORE_CHANNEL_ID = os.getenv("SCORE_CHANNEL_ID")
+
+REDIRECT_URI = f"{BACKEND_URL}/auth/callback"
+
+DISCORD_API_BASE = "https://discord.com/api"
 
 
 # -----------------------------
@@ -51,21 +55,37 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot_loop = None
+bot_ready_event = threading.Event()
+
+
+class UCGTBot(commands.Bot):
+    async def setup_hook(self):
+        global bot_loop
+        bot_loop = asyncio.get_running_loop()
+        print("Discord bot loop stored successfully.")
+
+
+bot = UCGTBot(command_prefix="!", intents=intents)
 
 
 @bot.event
 async def on_ready():
     print(f"Discord bot logged in as {bot.user}")
     print(f"Connected guilds: {[guild.name for guild in bot.guilds]}")
+    bot_ready_event.set()
 
 
 def run_bot_coroutine(coro):
-    """
-    Allows Flask routes, which are normal sync functions, to run async Discord bot code.
-    This fixes: name 'run_bot_coroutine' is not defined
-    """
-    future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+    global bot_loop
+
+    if bot_loop is None:
+        raise RuntimeError("Discord bot loop is not ready yet.")
+
+    if not bot_ready_event.wait(timeout=20):
+        raise RuntimeError("Discord bot is not ready yet.")
+
+    future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
     return future.result(timeout=20)
 
 
@@ -74,7 +94,10 @@ def start_bot():
         print("ERROR: DISCORD_BOT_TOKEN is missing.")
         return
 
-    bot.run(DISCORD_BOT_TOKEN)
+    try:
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        print(f"Discord bot failed to start: {e}")
 
 
 bot_thread = threading.Thread(target=start_bot, daemon=True)
@@ -89,150 +112,142 @@ def is_logged_in():
     return "discord_user" in session
 
 
-def get_logged_in_user():
+def get_current_user():
     return session.get("discord_user")
 
 
+def get_guild():
+    if GUILD_ID:
+        guild = bot.get_guild(int(GUILD_ID))
+        if guild:
+            return guild
+
+    if len(bot.guilds) > 0:
+        return bot.guilds[0]
+
+    return None
+
+
 async def user_has_referee_role(user_id):
-    await bot.wait_until_ready()
+    guild = get_guild()
 
-    guild = bot.get_guild(DISCORD_GUILD_ID)
-
-    if guild is None:
-        print("ROLE ERROR: Guild not found.")
+    if not guild:
+        print("No guild found.")
         return False
 
-    member = guild.get_member(int(user_id))
+    try:
+        member = guild.get_member(int(user_id))
 
-    if member is None:
-        try:
+        if member is None:
             member = await guild.fetch_member(int(user_id))
-        except Exception as e:
-            print("ROLE ERROR: Could not fetch member:", repr(e))
+
+        if member is None:
+            print("Member not found in guild.")
             return False
 
-    for role in member.roles:
-        if role.name == REFEREE_ROLE_NAME:
-            return True
+        for role in member.roles:
+            if role.name == REFEREE_ROLE_NAME:
+                return True
 
-    return False
+        print(f"User does not have role: {REFEREE_ROLE_NAME}")
+        return False
+
+    except Exception as e:
+        print(f"Role check error: {e}")
+        return False
 
 
 async def get_teams_from_channel():
-    await bot.wait_until_ready()
-
-    if not TEAMS_CHANNEL_ID:
-        print("TEAMS ERROR: TEAMS_CHANNEL_ID is missing or invalid.")
-        return []
-
-    teams_channel = bot.get_channel(TEAMS_CHANNEL_ID)
-
-    if teams_channel is None:
-        print("TEAMS ERROR: Channel not found by ID.")
-        print("TEAMS_CHANNEL_ID:", TEAMS_CHANNEL_ID)
-        print("Visible channels:")
-
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                print(f"- #{channel.name} | {channel.id}")
-
-        return []
-
-    print(f"TEAMS DEBUG: Found channel #{teams_channel.name} with ID {teams_channel.id}")
-
     teams = []
 
+    if not TEAMS_CHANNEL_ID:
+        print("TEAMS_CHANNEL_ID is missing.")
+        return teams
+
     try:
-        async for message in teams_channel.history(limit=200, oldest_first=True):
-            if message.author.bot:
-                continue
+        channel_id = int(TEAMS_CHANNEL_ID)
+    except ValueError:
+        print("TEAMS_CHANNEL_ID must be a number.")
+        return teams
 
-            print("TEAMS DEBUG: Raw message:", repr(message.content))
+    channel = bot.get_channel(channel_id)
 
-            # Handle Discord role mentions like @Counter Clockwise / CC
-            for role in message.role_mentions:
-                role_name = role.name.strip()
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            print(f"Could not fetch teams channel: {e}")
+            return teams
 
-                if role_name:
-                    print("TEAMS DEBUG: Found role mention:", role_name)
-                    teams.append(role_name)
+    if channel is None:
+        print("Teams channel not found.")
+        return teams
 
-            # Handle normal text lines
+    try:
+        async for message in channel.history(limit=100, oldest_first=True):
+            # If message contains role mentions like @Team Name
+            if message.role_mentions:
+                for role in message.role_mentions:
+                    role_name = role.name.strip()
+
+                    if role_name and role_name not in teams:
+                        teams.append(role_name)
+
+            # Also parse normal plain text lines
             lines = message.content.splitlines()
 
             for line in lines:
-                team = line.strip()
+                cleaned = line.strip()
 
-                if not team:
+                if not cleaned:
                     continue
 
-                # Remove common bullet characters
-                while team.startswith("-") or team.startswith("•") or team.startswith("*"):
-                    team = team[1:].strip()
-
-                if not team:
+                # Ignore raw role mention IDs like <@&123456789>
+                if cleaned.startswith("<@&") and cleaned.endswith(">"):
                     continue
 
-                # Skip raw role/user/channel mentions
-                if team.startswith("<@&") and team.endswith(">"):
-                    continue
+                # Remove common bullet/list formatting
+                cleaned = cleaned.lstrip("-").strip()
+                cleaned = cleaned.lstrip("•").strip()
+                cleaned = cleaned.lstrip("*").strip()
 
-                if team.startswith("<@") and team.endswith(">"):
-                    continue
+                # Remove numbered list format like 1. Team Name
+                if ". " in cleaned:
+                    possible_number, possible_team = cleaned.split(". ", 1)
+                    if possible_number.isdigit():
+                        cleaned = possible_team.strip()
 
-                if team.startswith("<#") and team.endswith(">"):
-                    continue
-
-                # If a line contains role mention syntax, skip it because message.role_mentions handles it better
-                if "<@&" in team:
-                    continue
-
-                teams.append(team)
+                if cleaned and cleaned not in teams:
+                    teams.append(cleaned)
 
     except discord.Forbidden:
-        print("TEAMS ERROR: Bot does not have permission to read the teams channel.")
-        return []
-
-    except discord.HTTPException as e:
-        print("TEAMS ERROR: Discord HTTP error:", repr(e))
-        return []
+        print("Bot does not have permission to read the teams channel.")
+        return teams
 
     except Exception as e:
-        print("TEAMS ERROR:", repr(e))
-        return []
+        print(f"Error reading teams channel: {e}")
+        return teams
 
-    clean_teams = []
-    seen = set()
-
-    for team in teams:
-        team = team.strip()
-
-        if not team:
-            continue
-
-        key = team.lower()
-
-        if key not in seen:
-            clean_teams.append(team)
-            seen.add(key)
-
-    print("TEAMS DEBUG: Loaded teams:", clean_teams)
-
-    return clean_teams
+    print(f"Loaded teams: {teams}")
+    return teams
 
 
 async def send_score_to_discord(data):
-    await bot.wait_until_ready()
-
     if not SCORE_CHANNEL_ID:
-        print("SCORE ERROR: SCORE_CHANNEL_ID is missing or invalid.")
-        return False
+        raise RuntimeError("SCORE_CHANNEL_ID is missing.")
 
-    channel = bot.get_channel(SCORE_CHANNEL_ID)
+    try:
+        channel_id = int(SCORE_CHANNEL_ID)
+    except ValueError:
+        raise RuntimeError("SCORE_CHANNEL_ID must be a number.")
+
+    channel = bot.get_channel(channel_id)
 
     if channel is None:
-        print("SCORE ERROR: Score channel not found.")
-        return False
+        channel = await bot.fetch_channel(channel_id)
+
+    if channel is None:
+        raise RuntimeError("Score channel not found.")
 
     team1 = data.get("team1", "Team 1")
     team2 = data.get("team2", "Team 2")
@@ -247,6 +262,7 @@ async def send_score_to_discord(data):
     )
 
     await channel.send(message)
+
     return True
 
 
@@ -254,26 +270,17 @@ async def send_score_to_discord(data):
 # Auth Routes
 # -----------------------------
 
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "UCGT backend running",
-        "frontend": FRONTEND_URL,
-        "backend": BACKEND_URL
-    })
-
-
 @app.route("/auth/discord")
 def auth_discord():
-    discord_auth_url = (
-        "https://discord.com/oauth2/authorize"
-        f"?client_id={DISCORD_CLIENT_ID}"
-        "&response_type=code"
-        f"&redirect_uri={requests.utils.quote(REDIRECT_URI, safe='')}"
-        "&scope=identify%20guilds"
-    )
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds.members.read"
+    }
 
-    return redirect(discord_auth_url)
+    query = requests.compat.urlencode(params)
+    return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
 
 
 @app.route("/auth/callback")
@@ -288,7 +295,7 @@ def auth_callback():
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": REDIRECT_URI
     }
 
     headers = {
@@ -296,26 +303,27 @@ def auth_callback():
     }
 
     token_response = requests.post(
-        "https://discord.com/api/oauth2/token",
+        f"{DISCORD_API_BASE}/oauth2/token",
         data=token_data,
         headers=headers
     )
 
     if token_response.status_code != 200:
-        print("OAUTH ERROR:", token_response.text)
+        print("Token response error:", token_response.text)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
-    access_token = token_response.json().get("access_token")
+    token_json = token_response.json()
+    access_token = token_json.get("access_token")
 
     user_response = requests.get(
-        "https://discord.com/api/users/@me",
+        f"{DISCORD_API_BASE}/users/@me",
         headers={
             "Authorization": f"Bearer {access_token}"
         }
     )
 
     if user_response.status_code != 200:
-        print("USER ERROR:", user_response.text)
+        print("User response error:", user_response.text)
         return redirect(f"{FRONTEND_URL}/denied.html")
 
     user = user_response.json()
@@ -326,10 +334,10 @@ def auth_callback():
         return redirect(f"{FRONTEND_URL}/denied.html")
 
     session["discord_user"] = {
-        "id": user["id"],
+        "id": user.get("id"),
         "username": user.get("username"),
-        "avatar": user.get("avatar"),
         "global_name": user.get("global_name"),
+        "avatar": user.get("avatar")
     }
 
     return redirect(f"{FRONTEND_URL}/index.html")
@@ -349,12 +357,12 @@ def logout():
 def api_me():
     if not is_logged_in():
         return jsonify({
-            "logged_in": False
+            "loggedIn": False
         }), 401
 
     return jsonify({
-        "logged_in": True,
-        "user": get_logged_in_user()
+        "loggedIn": True,
+        "user": get_current_user()
     })
 
 
@@ -369,7 +377,7 @@ def api_teams():
         })
 
     except Exception as e:
-        print("API TEAMS ERROR:", repr(e))
+        print(f"/api/teams error: {e}")
 
         return jsonify({
             "teams": [],
@@ -386,23 +394,23 @@ def api_send_score():
             "error": "Not logged in"
         }), 401
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "error": "Missing JSON body"
+        }), 400
 
     try:
-        success = run_bot_coroutine(send_score_to_discord(data))
-
-        if not success:
-            return jsonify({
-                "success": False,
-                "error": "Could not send score to Discord"
-            }), 500
+        run_bot_coroutine(send_score_to_discord(data))
 
         return jsonify({
             "success": True
         })
 
     except Exception as e:
-        print("SEND SCORE ERROR:", repr(e))
+        print(f"/api/send-score error: {e}")
 
         return jsonify({
             "success": False,
@@ -410,37 +418,50 @@ def api_send_score():
         }), 500
 
 
-# -----------------------------
-# Debug Routes
-# -----------------------------
-
 @app.route("/api/debug-discord")
-def debug_discord():
+def api_debug_discord():
     try:
-        guilds = []
+        guild = get_guild()
 
-        for guild in bot.guilds:
-            channels = []
+        teams_channel = None
+        score_channel = None
 
-            for channel in guild.text_channels:
-                channels.append({
-                    "name": channel.name,
-                    "id": str(channel.id)
-                })
+        if TEAMS_CHANNEL_ID:
+            try:
+                teams_channel = bot.get_channel(int(TEAMS_CHANNEL_ID))
+            except Exception:
+                teams_channel = None
 
-            guilds.append({
-                "name": guild.name,
-                "id": str(guild.id),
-                "channels": channels
-            })
+        if SCORE_CHANNEL_ID:
+            try:
+                score_channel = bot.get_channel(int(SCORE_CHANNEL_ID))
+            except Exception:
+                score_channel = None
 
         return jsonify({
-            "bot_ready": bot.is_ready(),
+            "bot_ready": bot_ready_event.is_set(),
             "bot_user": str(bot.user) if bot.user else None,
-            "guild_id_env": str(DISCORD_GUILD_ID),
-            "teams_channel_id_env": str(TEAMS_CHANNEL_ID),
-            "score_channel_id_env": str(SCORE_CHANNEL_ID),
-            "guilds": guilds
+            "guilds": [
+                {
+                    "id": str(g.id),
+                    "name": g.name
+                }
+                for g in bot.guilds
+            ],
+            "selected_guild": {
+                "id": str(guild.id),
+                "name": guild.name
+            } if guild else None,
+            "teams_channel_id_env": TEAMS_CHANNEL_ID,
+            "teams_channel_found": teams_channel is not None,
+            "teams_channel_name": teams_channel.name if teams_channel else None,
+            "score_channel_id_env": SCORE_CHANNEL_ID,
+            "score_channel_found": score_channel is not None,
+            "score_channel_name": score_channel.name if score_channel else None,
+            "referee_role_name": REFEREE_ROLE_NAME,
+            "frontend_url": FRONTEND_URL,
+            "backend_url": BACKEND_URL,
+            "redirect_uri": REDIRECT_URI
         })
 
     except Exception as e:
@@ -449,10 +470,23 @@ def debug_discord():
         }), 500
 
 
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "UCGT backend running",
+        "frontend": FRONTEND_URL,
+        "backend": BACKEND_URL
+    })
+
+
 # -----------------------------
-# Run App
+# Run Flask App
 # -----------------------------
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
