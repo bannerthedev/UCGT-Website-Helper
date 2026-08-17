@@ -130,27 +130,17 @@ async def user_has_referee_role(user_id):
 
 
 async def get_teams_from_channel():
-    guild = bot.get_guild(GUILD_ID)
+    await bot.wait_until_ready()
 
-    if guild is None:
-        print("Teams error: Guild not found. Check GUILD_ID.")
-        return []
-
-    print(f"Looking for teams channel named: {TEAMS_CHANNEL_NAME}")
-
-    teams_channel = discord.utils.get(
-        guild.text_channels,
-        name=TEAMS_CHANNEL_NAME
-    )
+    teams_channel_id = int(os.getenv("TEAMS_CHANNEL_ID", "0"))
+    teams_channel = bot.get_channel(teams_channel_id)
 
     if teams_channel is None:
-        print("Teams error: Channel not found.")
-        print("Available text channels:")
-        for channel in guild.text_channels:
-            print(f"- {channel.name}")
+        print("TEAMS ERROR: Channel not found by ID.")
+        print("TEAMS_CHANNEL_ID:", teams_channel_id)
         return []
 
-    print(f"Found teams channel: #{teams_channel.name}")
+    print(f"TEAMS DEBUG: Found channel: #{teams_channel.name}")
 
     teams = []
 
@@ -164,25 +154,45 @@ async def get_teams_from_channel():
             for line in lines:
                 team = line.strip()
 
-                # Remove common bullets
-                while team.startswith("-") or team.startswith("•") or team.startswith("*"):
-                    team = team[1:].strip()
-
-                # Ignore empty lines
                 if not team:
                     continue
 
-                teams.append(team)
+                while team.startswith("-") or team.startswith("•") or team.startswith("*"):
+                    team = team[1:].strip()
+
+                # Convert Discord role mentions like <@&123456789> into role names
+                if team.startswith("<@&") and team.endswith(">"):
+                    role_id_text = team.replace("<@&", "").replace(">", "")
+
+                    try:
+                        role_id = int(role_id_text)
+                        role = message.guild.get_role(role_id)
+
+                        if role:
+                            team = role.name
+                        else:
+                            print(f"TEAMS WARNING: Could not find role for ID {role_id}")
+                            continue
+
+                    except ValueError:
+                        continue
+
+                # Convert user mentions like <@123456789> or <@!123456789>
+                elif team.startswith("<@") and team.endswith(">"):
+                    print(f"TEAMS WARNING: Skipping user mention: {team}")
+                    continue
+
+                if team:
+                    teams.append(team)
 
     except discord.Forbidden:
-        print("Teams error: Bot does not have permission to read #teams.")
+        print("TEAMS ERROR: Bot does not have permission to read the teams channel.")
         return []
 
     except Exception as e:
-        print("Teams error:", e)
+        print("TEAMS ERROR:", repr(e))
         return []
 
-    # Remove duplicates but keep order
     clean_teams = []
     seen = set()
 
@@ -193,7 +203,7 @@ async def get_teams_from_channel():
             clean_teams.append(team)
             seen.add(key)
 
-    print(f"Teams loaded: {clean_teams}")
+    print("TEAMS DEBUG: Loaded teams:", clean_teams)
 
     return clean_teams
 
