@@ -133,12 +133,24 @@ async def get_teams_from_channel():
     guild = bot.get_guild(GUILD_ID)
 
     if guild is None:
+        print("Teams error: Guild not found. Check GUILD_ID.")
         return []
 
-    teams_channel = discord.utils.get(guild.text_channels, name=TEAMS_CHANNEL_NAME)
+    print(f"Looking for teams channel named: {TEAMS_CHANNEL_NAME}")
+
+    teams_channel = discord.utils.get(
+        guild.text_channels,
+        name=TEAMS_CHANNEL_NAME
+    )
 
     if teams_channel is None:
+        print("Teams error: Channel not found.")
+        print("Available text channels:")
+        for channel in guild.text_channels:
+            print(f"- {channel.name}")
         return []
+
+    print(f"Found teams channel: #{teams_channel.name}")
 
     teams = []
 
@@ -152,15 +164,22 @@ async def get_teams_from_channel():
             for line in lines:
                 team = line.strip()
 
-                # Clean bullet points
-                while team.startswith("-") or team.startswith("•"):
+                # Remove common bullets
+                while team.startswith("-") or team.startswith("•") or team.startswith("*"):
                     team = team[1:].strip()
 
-                if team:
-                    teams.append(team)
+                # Ignore empty lines
+                if not team:
+                    continue
+
+                teams.append(team)
+
+    except discord.Forbidden:
+        print("Teams error: Bot does not have permission to read #teams.")
+        return []
 
     except Exception as e:
-        print("Error reading teams channel:", e)
+        print("Teams error:", e)
         return []
 
     # Remove duplicates but keep order
@@ -168,9 +187,13 @@ async def get_teams_from_channel():
     seen = set()
 
     for team in teams:
-        if team.lower() not in seen:
+        key = team.lower()
+
+        if key not in seen:
             clean_teams.append(team)
-            seen.add(team.lower())
+            seen.add(key)
+
+    print(f"Teams loaded: {clean_teams}")
 
     return clean_teams
 
