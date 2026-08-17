@@ -359,20 +359,22 @@ def api_me():
 
 @app.route("/api/teams")
 def api_teams():
-    if not is_logged_in():
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
     try:
-        teams = run_async(get_teams_from_channel())
-    except Exception as e:
-        print("Teams error:", e)
-        teams = []
+        teams = run_bot_coroutine(get_teams_from_channel())
 
-    return jsonify({
-        "teams": teams
-    })
+        return jsonify({
+            "teams": teams,
+            "count": len(teams)
+        })
+
+    except Exception as e:
+        print("API TEAMS ERROR:", repr(e))
+
+        return jsonify({
+            "teams": [],
+            "count": 0,
+            "error": str(e)
+        }), 500
 
 
 @app.route("/api/send-score", methods=["POST"])
