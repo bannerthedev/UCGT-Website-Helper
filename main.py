@@ -63,7 +63,7 @@ class UCGTBot(commands.Bot):
     async def setup_hook(self):
         global bot_loop
         bot_loop = asyncio.get_running_loop()
-        print("Discord bot loop stored successfully.")
+        print("Discord bot loop stored successfully.", flush=True)
 
 
 bot = UCGTBot(command_prefix="!", intents=intents)
@@ -71,33 +71,46 @@ bot = UCGTBot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Discord bot logged in as {bot.user}")
-    print(f"Connected guilds: {[guild.name for guild in bot.guilds]}")
+    print(f"Discord bot logged in as {bot.user}", flush=True)
+    print(f"Connected guilds: {[guild.name for guild in bot.guilds]}", flush=True)
     bot_ready_event.set()
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"Discord bot error in event: {event}", flush=True)
 
 
 def run_bot_coroutine(coro):
     global bot_loop
 
-    if bot_loop is None:
-        raise RuntimeError("Discord bot loop is not ready yet.")
+    print("Waiting for Discord bot to be ready...", flush=True)
 
-    if not bot_ready_event.wait(timeout=20):
-        raise RuntimeError("Discord bot is not ready yet.")
+    if not bot_ready_event.wait(timeout=30):
+        raise RuntimeError(
+            "Discord bot is not ready yet. Check Railway logs to see if the bot token is missing, invalid, or the bot crashed."
+        )
+
+    if bot_loop is None:
+        raise RuntimeError(
+            "Discord bot loop is still not ready. The bot probably failed during startup."
+        )
 
     future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
-    return future.result(timeout=20)
+    return future.result(timeout=30)
 
 
 def start_bot():
+    print("Starting Discord bot thread...", flush=True)
+
     if not DISCORD_BOT_TOKEN:
-        print("ERROR: DISCORD_BOT_TOKEN is missing.")
+        print("ERROR: DISCORD_BOT_TOKEN is missing.", flush=True)
         return
 
     try:
         bot.run(DISCORD_BOT_TOKEN)
     except Exception as e:
-        print(f"Discord bot failed to start: {e}")
+        print(f"Discord bot failed to start: {e}", flush=True)
 
 
 bot_thread = threading.Thread(target=start_bot, daemon=True)
@@ -270,18 +283,62 @@ async def send_score_to_discord(data):
 # Auth Routes
 # -----------------------------
 
-@app.route("/auth/discord")
-def auth_discord():
-    params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify guilds.members.read"
-    }
+@app.route("/api/debug-discord")
+def api_debug_discord():
+    try:
+        guild = get_guild()
 
-    query = requests.compat.urlencode(params)
-    return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
+        teams_channel = None
+        score_channel = None
 
+        if TEAMS_CHANNEL_ID:
+            try:
+                teams_channel = bot.get_channel(int(TEAMS_CHANNEL_ID))
+            except Exception:
+                teams_channel = None
+
+        if SCORE_CHANNEL_ID:
+            try:
+                score_channel = bot.get_channel(int(SCORE_CHANNEL_ID))
+            except Exception:
+                score_channel = None
+
+        return jsonify({
+            "bot_loop_ready": bot_loop is not None,
+            "bot_ready": bot_ready_event.is_set(),
+            "bot_user": str(bot.user) if bot.user else None,
+            "guild_count": len(bot.guilds),
+            "guilds": [
+                {
+                    "id": str(g.id),
+                    "name": g.name
+                }
+                for g in bot.guilds
+            ],
+            "selected_guild": {
+                "id": str(guild.id),
+                "name": guild.name
+            } if guild else None,
+            "teams_channel_id_env": TEAMS_CHANNEL_ID,
+            "teams_channel_found": teams_channel is not None,
+            "teams_channel_name": teams_channel.name if teams_channel else None,
+            "score_channel_id_env": SCORE_CHANNEL_ID,
+            "score_channel_found": score_channel is not None,
+            "score_channel_name": score_channel.name if score_channel else None,
+            "has_discord_bot_token": bool(DISCORD_BOT_TOKEN),
+            "has_discord_client_id": bool(DISCORD_CLIENT_ID),
+            "has_discord_client_secret": bool(DISCORD_CLIENT_SECRET),
+            "guild_id_env": GUILD_ID,
+            "referee_role_name": REFEREE_ROLE_NAME,
+            "frontend_url": FRONTEND_URL,
+            "backend_url": BACKEND_URL,
+            "redirect_uri": REDIRECT_URI
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 @app.route("/auth/callback")
 def auth_callback():
