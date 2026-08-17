@@ -4,3 +4,4 @@ requests
 discord.py
 python-dotenv
 gunicorn
+audioop-lts
